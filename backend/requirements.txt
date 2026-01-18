@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+pydantic
+python-dotenv
+requests
+python-multipart
+# whatsapp-python-sdk # Opcional si usamos una lib, pero requests va bien para iniciar
