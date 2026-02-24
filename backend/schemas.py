@@ -16,7 +16,7 @@ class Invoice(InvoiceBase):
     client_id: int
 
     class Config:
-        orm_mode = True
+        from_attributes = True 
 
 class ClientBase(BaseModel):
     first_name: str
@@ -29,6 +29,8 @@ class ClientBase(BaseModel):
     ip_address: Optional[str] = None
     service_status: str = "Active"
     billing_day: int
+    # --- CAMBIO A ID DEL SWITCH ---
+    network_device_id: Optional[int] = None
 
 class ClientCreate(ClientBase):
     pass
@@ -44,6 +46,8 @@ class ClientUpdate(BaseModel):
     ip_address: Optional[str] = None
     service_status: Optional[str] = None
     billing_day: Optional[int] = None
+    # --- CAMBIO A ID DEL SWITCH ---
+    network_device_id: Optional[int] = None
 
 class Client(ClientBase):
     id: int
@@ -51,4 +55,33 @@ class Client(ClientBase):
     invoices: List[Invoice] = []
 
     class Config:
-        orm_mode = True
+        from_attributes = True 
+
+class SetupCreate(BaseModel):
+    vendor: str = "mikrotik" 
+    mikrotik_ip: str
+    mikrotik_user: str
+    mikrotik_password: str
+    mikrotik_port: int = 8728
+    company_name: str = "Kingsystem Solutions"
+    new_admin_password: str  
+
+class SetupStatus(BaseModel):
+    is_installed: bool
+    company_name: str
+
+class SwitchCreate(BaseModel):
+    name: str
+    ip_address: str
+    username: str
+    password: str
+    lan_segment: Optional[str] = None
+    location: Optional[str] = "Nodo Principal"
+
+class SwitchResponse(SwitchCreate):
+    id: int
+    vendor: str
+    status: str 
+
+    class Config:
+        from_attributes = True

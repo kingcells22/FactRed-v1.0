@@ -1,93 +1,130 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from datetime import date, timedelta
-import models, schemas, database, crud
+import models, schemas, database
 from typing import List
+# --- IMPORTAMOS EL SERVICIO REAL ---
+from services.mikrotik import mikrotik_service 
+# -----------------------------------
 
 router = APIRouter(
     prefix="/billing",
     tags=["billing"],
 )
 
-# Mock notification service
+# Mock notification service (Este lo dejamos así por ahora)
 def send_whatsapp_notification(phone: str, message: str):
     print(f"--- WHATSAPP MOCK ({phone}) ---")
     print(message)
     print("-------------------------------")
     return True
 
-# Mock network service
-def suspend_service(ip_address: str):
+# --- LÓGICA DE CORTE REAL ---
+def toggle_network_access(ip_address: str, allow_access: bool):
+    """
+    Llama al MikroTik para cortar (allow_access=False) 
+    o reconectar (allow_access=True)
+    """
     if not ip_address:
-        return
-    print(f"--- NETWORK SUSPEND ({ip_address}) ---")
-    print(f"Service suspended for IP {ip_address}")
-    return True
+        return False
+    
+    # Si allow_access es False (Cortar), activar=False en el servicio (lo manda a morosos)
+    # Si allow_access es True (Pagar), activar=True en el servicio (lo saca de morosos)
+    success = mikrotik_service.toggle_service(ip_address, activar=allow_access)
+    return success
+# ----------------------------
 
 @router.post("/process-daily")
 def process_daily_billing(db: Session = Depends(database.get_db)):
     """
-    Checks all clients for billing dates and performs actions:
-    1. Generate invoice if billing date is newly reached.
-    2. Send reminder if close to due date.
-    3. Suspend if overdue.
+    Genera facturas y CORTA el servicio a los morosos.
     """
     today = date.today()
     clients = db.query(models.Client).filter(models.Client.service_status == "Active").all()
     results = []
 
     for client in clients:
-        # Simple Logic: Billing day is the day of month client must pay
-        # E.g., if billing_day is 5.
-        
-        # 1. Check if we need to generate an invoice for this month
-        # Logic: If today is billing_day, generate invoice (due in 5 days?)
-        # For simplicity, let's assume cutting date = billing_day
-        
-        # This is a rigorous implementation of "Corte" vs "Vencimiento"
-        # Let's say: Create Invoice 5 days BEFORE Cutting Date
-        # Due Date = Cutting Date
-        
-        # ... Implementation simplified for the MVP:
-        # If today == billing_day: Generate Invoice due in 5 days.
-        
-        if today.day == client.billing_day:
-            # Check if invoice already exists for this month/year
-            # (Skipping check for simplicity in this MVP step, assume single run)
+        # 1. Generar Factura (Si es su día de corte)
+        # (Lógica simplificada: Si hoy es el día, factura)
+        if today.day == client.billing_day or (today.day > 28 and client.billing_day >= 28):
+            # Verificar si ya tiene factura este mes para no duplicar
+            current_month_invoice = db.query(models.Invoice).filter(
+                models.Invoice.client_id == client.id,
+                models.Invoice.issue_date >= today.replace(day=1)
+            ).first()
             
-            invoice = models.Invoice(
-                client_id=client.id,
-                amount=client.plan_amount,
-                issue_date=today,
-                due_date=today + timedelta(days=5),
-                status="Pending"
-            )
-            db.add(invoice)
-            db.commit()
-            
-            msg = f"Hola {client.first_name}, tu factura #{invoice.id} de {client.plan_amount} ya fue generada. Vence el {invoice.due_date}."
-            send_whatsapp_notification(client.contact_number, msg)
-            results.append(f"Generated invoice for {client.first_name}")
+            if not current_month_invoice:
+                invoice = models.Invoice(
+                    client_id=client.id,
+                    amount=client.plan_amount,
+                    issue_date=today,
+                    due_date=today + timedelta(days=5), # Vence en 5 días
+                    status="Pending"
+                )
+                db.add(invoice)
+                db.commit()
+                results.append(f"Factura generada para {client.first_name}")
 
-        # 2. Check Overdue
-        # Find pending invoices that are past due date
+        # 2. Verificar MOROSIDAD (El Corte)
+        # Buscamos facturas pendientes QUE YA VENCIERON (fecha < hoy)
         overdue_invoices = db.query(models.Invoice).filter(
             models.Invoice.client_id == client.id,
             models.Invoice.status == "Pending",
-            models.Invoice.due_date < today
+            models.Invoice.due_date < today 
         ).all()
 
         if overdue_invoices:
-            # Suspend Service!
-            client.service_status = "Suspended"
-            suspend_service(client.ip_address)
+            # ¡AQUÍ OCURRE EL CORTE REAL!
+            print(f"?? Cliente {client.first_name} tiene deuda. Cortando servicio...")
             
-            msg = f"AVISO DE CORTE: {client.first_name}, servicio suspendido por facturas vencidas. Total deuda: {sum(i.amount for i in overdue_invoices)}"
-            send_whatsapp_notification(client.contact_number, msg)
-            results.append(f"Suspended {client.first_name}")
+            # 1. Cambiar estado en BD
+            client.service_status = "Suspended"
+            
+            # 2. Mandar orden al MikroTik
+            toggle_network_access(client.ip_address, allow_access=False)
+            
+            results.append(f"CORTADO: {client.first_name} (IP: {client.ip_address})")
             db.commit()
 
     return {"processed": True, "details": results}
+
+# --- NUEVO ENDPOINT PARA PROBAR EL CORTE MANUALMENTE ---
+@router.post("/manual-suspend/{client_id}")
+def manual_suspend(client_id: int, db: Session = Depends(database.get_db)):
+    """Fuerza el corte de un cliente inmediatamente para pruebas"""
+    client = db.query(models.Client).filter(models.Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
+    
+    # Cortar en BD
+    client.service_status = "Suspended"
+    db.commit()
+    
+    # Cortar en MikroTik
+    success = toggle_network_access(client.ip_address, allow_access=False)
+    
+    if success:
+        return {"message": f"Servicio cortado exitosamente a {client.ip_address}"}
+    else:
+        return {"message": "Error al comunicar con MikroTik, revisa la consola del backend"}
+
+@router.post("/manual-activate/{client_id}")
+def manual_activate(client_id: int, db: Session = Depends(database.get_db)):
+    """Reactiva el servicio manualmente"""
+    client = db.query(models.Client).filter(models.Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
+    
+    client.service_status = "Active"
+    db.commit()
+    
+    success = toggle_network_access(client.ip_address, allow_access=True)
+    
+    if success:
+        return {"message": f"Servicio reactivado para {client.ip_address}"}
+    else:
+        return {"message": "Error al comunicar con MikroTik"}
+# -------------------------------------------------------
 
 @router.get("/invoices/{client_id}", response_model=List[schemas.Invoice])
 def get_client_invoices(client_id: int, db: Session = Depends(database.get_db)):
@@ -95,18 +132,15 @@ def get_client_invoices(client_id: int, db: Session = Depends(database.get_db)):
 
 @router.get("/stats")
 def get_billing_stats(db: Session = Depends(database.get_db)):
-    # Total Pending Amount
     pending_invoices = db.query(models.Invoice).filter(models.Invoice.status == "Pending").all()
     total_pending = sum(inv.amount for inv in pending_invoices)
     
-    # Count overdue (assuming today is checking date)
     today = date.today()
     overdue_count = db.query(models.Invoice).filter(
         models.Invoice.status == "Pending",
         models.Invoice.due_date < today
     ).count()
 
-    # Network Status (Mock based on suspended clients)
     suspended_count = db.query(models.Client).filter(models.Client.service_status == "Suspended").count()
     
     return {
